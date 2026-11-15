@@ -81,7 +81,7 @@ private fun requestPage(ctx: Context, page: Int) {
  *
  * [totalPictures] is the camera-reported picture count; one cell is reserved for each so the
  * scroll range matches the whole card. Index 0 is the newest picture. Thumbnails are loaded a
- * page at a time for the cells currently on screen (plus one page ahead) and kept in the app cache.
+ * page at a time for the cells currently on screen and kept in the app cache.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -104,7 +104,7 @@ fun PicList(
         }.collect { range ->
             if (range != null) {
                 val first = range.first / imagesPerRequest
-                val last = range.second / imagesPerRequest + 1 //prefetch one page ahead
+                val last = range.second / imagesPerRequest
                 wantedPages = first..last
                 for (page in first..last) requestPage(ctx, page)
             }
