@@ -23,7 +23,9 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.URL
+import java.time.LocalDate
 import java.util.Collections
+import kotlinx.coroutines.CancellationException
 
 var curIndex = 0;
 var numPicsOnCamera = 0;
@@ -34,6 +36,25 @@ var cameraIPAddress = ""
 val imagesPerRequest = 21
 var deviceUUID = "4D454930-0100-1000-8001-"
 var cameraMode = ""
+var cameraName = "" //camera model, used as the download folder name
+
+/** Download folder under DCIM: the camera model name, or "Lumix" if it couldn't be read. */
+fun downloadFolder(): String = cameraName.ifEmpty { "Lumix" }
+
+/** Reads the camera model (e.g. DMC-G85) from the capability info; leaves the name empty on failure. */
+fun readCameraName() {
+    try {
+        val text = String(readBytesWithTimeout("http://$cameraIPAddress:80/cam.cgi?mode=getinfo&type=capability"))
+        println("Capability info: $text")
+        for (tag in listOf("model_name", "modelname", "productname", "product_name")) {
+            val m = Regex("<$tag>([^<]+)</$tag>", RegexOption.IGNORE_CASE).find(text) ?: continue
+            val name = m.groupValues[1].trim().replace(Regex("[^A-Za-z0-9_\\- ]"), "").trim()
+            if (name.isNotEmpty()) { cameraName = name; return }
+        }
+    } catch (e: Exception) {
+        println("Unable to read camera name: $e")
+    }
+}
 
 suspend fun doKeepAlive() {
     while(true) {
@@ -89,6 +110,7 @@ suspend fun getCameraIntoPlaybackMode() {
 suspend fun getAvailablePictures() {
     getCameraIntoPlaybackMode() //first get the camera ready
     withContext(Dispatchers.IO) {
+        readCameraName()
         println("Requesting Available Images")
         val url = URL("http://$cameraIPAddress:60606/Server0/CDS_control")
         val con = url.openConnection() as HttpURLConnection
@@ -190,16 +212,19 @@ suspend fun downloadHQImage(path: String, ctx: Context, downloadDialogVisible: (
     }
     val resolver = ctx.contentResolver;
     val info = ContentValues();
-    var imageUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, info);
+    // Fill in the name/path/type BEFORE inserting, otherwise MediaStore picks its own name and folder
     if(isVideo) {
         info.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName.substring(0, fileName.length - 3) + "mp4");
         info.put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4");
-        imageUri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, info);
     } else {
         info.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
         info.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg");
     }
-    info.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + File.separator + "Shutterlink");
+    info.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + File.separator + downloadFolder());
+    val imageUri = resolver.insert(
+        if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        info
+    );
     val os = resolver.openOutputStream(imageUri!!);
     if (os != null) {
         os.write(imageData)
@@ -581,3 +606,109 @@ suspend fun downloadThumbnail(context: Context, pic: String, downloadLocation: (
     downloadLocation(pic)
 }
 
+
+const val BATCH_PAUSE_MS = 2000L //let the camera finish processing before the next picture
+
+/** A picture on the camera: its thumbnail file name (DT*) and the date it was taken, if reported. */
+data class CameraPicture(val thumbName: String, val date: LocalDate?)
+
+/** Browses [count] items starting at the camera index [startingIndex] (oldest first). */
+private fun browsePictures(startingIndex: Int, count: Int): List<CameraPicture> {
+    val con = URL("http://$cameraIPAddress:60606/Server0/CDS_control").openConnection() as HttpURLConnection
+    con.connectTimeout = CAMERA_TIMEOUT_MS
+    con.readTimeout = CAMERA_TIMEOUT_MS
+    try {
+        con.requestMethod = "POST"
+        con.setRequestProperty("Content-Type", "text/xml");
+        con.setRequestProperty("SOAPACTION", "urn:schemas-upnp-org:service:ContentDirectory:1#Browse");
+        con.doOutput = true;
+        con.outputStream.use { os ->
+            val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\" xmlns:pana=\"urn:schemas-panasonic-com:pana\"><ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>$startingIndex</StartingIndex><RequestedCount>$count</RequestedCount><SortCriteria></SortCriteria><pana:X_FromCP>Shutterlink</pana:X_FromCP></u:Browse></s:Body></s:Envelope>".toByteArray(Charsets.UTF_8)
+            os.write(body, 0, body.size)
+        }
+        // The DIDL-Lite result is XML-escaped inside the SOAP response
+        val data = con.inputStream.bufferedReader().readText()
+            .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&")
+        val urlRegex = Regex("http://\\d{2,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}:\\d+/(DT\\w+\\.JPG)")
+        val dateRegex = Regex("<dc:date>\\s*(\\d{4}-\\d{2}-\\d{2})")
+        return data.split("<item").drop(1).mapNotNull { item ->
+            val name = urlRegex.find(item)?.groupValues?.get(1) ?: return@mapNotNull null
+            val date = dateRegex.find(item)?.groupValues?.get(1)?.let { LocalDate.parse(it) }
+            CameraPicture(name, date)
+        } //oldest first, like the camera lists them
+    } finally {
+        con.disconnect()
+    }
+}
+
+/**
+ * Lists the pictures taken on or after [cutoff], newest first. Pages are read from the newest
+ * picture backwards and reading stops at the first picture older than the cutoff.
+ */
+suspend fun listPicturesSince(cutoff: LocalDate): List<CameraPicture> = withContext(Dispatchers.IO) {
+    val result = ArrayList<CameraPicture>()
+    var page = 0
+    while (true) {
+        val first = page * imagesPerRequest
+        val count = minOf(imagesPerRequest, numPicsOnCamera - first)
+        if (count <= 0) break
+        val items = browsePictures(numPicsOnCamera - first - count, count).reversed()
+        for (item in items) {
+            val date = item.date ?: throw IllegalStateException("The camera did not report picture dates")
+            if (date < cutoff) return@withContext result
+            result.add(item)
+        }
+        page++
+        delay(THUMBNAIL_PAUSE_MS)
+    }
+    result
+}
+
+/**
+ * Downloads the originals of [pictures] one by one, pausing [BATCH_PAUSE_MS] between them so the
+ * camera has time to process. [onProgress] receives (finished so far, failed so far).
+ * Returns the number of failed pictures.
+ */
+suspend fun downloadBatch(ctx: Context, pictures: List<CameraPicture>, onProgress: (Int, Int) -> Unit): Int {
+    var failed = 0
+    onProgress(0, 0)
+    for ((i, pic) in pictures.withIndex()) {
+        try {
+            withContext(Dispatchers.IO) { downloadHQImage(pic.thumbName, ctx, {}, {}) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            println("Batch download of ${pic.thumbName} failed: $e")
+            failed++
+        }
+        onProgress(i + 1, failed)
+        if (i < pictures.size - 1) delay(BATCH_PAUSE_MS)
+    }
+    return failed
+}
+
+/** Names (DO*.JPG / DO*.mp4) of files already saved in the camera's download folder (or the old DCIM/Shutterlink). */
+private fun alreadyDownloadedNames(ctx: Context): Set<String> {
+    val names = HashSet<String>()
+    for (collection in listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)) {
+        ctx.contentResolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+            "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? OR ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+            arrayOf("DCIM/${downloadFolder()}/%", "DCIM/Shutterlink/%"), //also the old folder name
+            null
+        )?.use { c -> while (c.moveToNext()) names.add(c.getString(0)) }
+    }
+    return names
+}
+
+/** Splits [pictures] into those still to download and the number already saved on the phone. */
+suspend fun skipAlreadyDownloaded(ctx: Context, pictures: List<CameraPicture>): Pair<List<CameraPicture>, Int> =
+    withContext(Dispatchers.IO) {
+        val have = alreadyDownloadedNames(ctx)
+        val todo = pictures.filter {
+            val base = "DO" + it.thumbName.substring(2, it.thumbName.length - 3)
+            !(have.contains(base + "JPG") || have.contains(base + "mp4"))
+        }
+        todo to (pictures.size - todo.size)
+    }
