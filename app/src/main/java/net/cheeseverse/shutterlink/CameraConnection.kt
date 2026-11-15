@@ -23,7 +23,9 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.URL
+import java.time.LocalDate
 import java.util.Collections
+import kotlinx.coroutines.CancellationException
 
 var curIndex = 0;
 var numPicsOnCamera = 0;
@@ -581,3 +583,83 @@ suspend fun downloadThumbnail(context: Context, pic: String, downloadLocation: (
     downloadLocation(pic)
 }
 
+
+const val BATCH_PAUSE_MS = 2000L //let the camera finish processing before the next picture
+
+/** A picture on the camera: its thumbnail file name (DT*) and the date it was taken, if reported. */
+data class CameraPicture(val thumbName: String, val date: LocalDate?)
+
+/** Browses [count] items starting at the camera index [startingIndex] (oldest first). */
+private fun browsePictures(startingIndex: Int, count: Int): List<CameraPicture> {
+    val con = URL("http://$cameraIPAddress:60606/Server0/CDS_control").openConnection() as HttpURLConnection
+    con.connectTimeout = CAMERA_TIMEOUT_MS
+    con.readTimeout = CAMERA_TIMEOUT_MS
+    try {
+        con.requestMethod = "POST"
+        con.setRequestProperty("Content-Type", "text/xml");
+        con.setRequestProperty("SOAPACTION", "urn:schemas-upnp-org:service:ContentDirectory:1#Browse");
+        con.doOutput = true;
+        con.outputStream.use { os ->
+            val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\" xmlns:pana=\"urn:schemas-panasonic-com:pana\"><ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>$startingIndex</StartingIndex><RequestedCount>$count</RequestedCount><SortCriteria></SortCriteria><pana:X_FromCP>Shutterlink</pana:X_FromCP></u:Browse></s:Body></s:Envelope>".toByteArray(Charsets.UTF_8)
+            os.write(body, 0, body.size)
+        }
+        // The DIDL-Lite result is XML-escaped inside the SOAP response
+        val data = con.inputStream.bufferedReader().readText()
+            .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&")
+        val urlRegex = Regex("http://\\d{2,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}:\\d+/(DT\\w+\\.JPG)")
+        val dateRegex = Regex("<dc:date>\\s*(\\d{4}-\\d{2}-\\d{2})")
+        return data.split("<item").drop(1).mapNotNull { item ->
+            val name = urlRegex.find(item)?.groupValues?.get(1) ?: return@mapNotNull null
+            val date = dateRegex.find(item)?.groupValues?.get(1)?.let { LocalDate.parse(it) }
+            CameraPicture(name, date)
+        } //oldest first, like the camera lists them
+    } finally {
+        con.disconnect()
+    }
+}
+
+/**
+ * Lists the pictures taken on or after [cutoff], newest first. Pages are read from the newest
+ * picture backwards and reading stops at the first picture older than the cutoff.
+ */
+suspend fun listPicturesSince(cutoff: LocalDate): List<CameraPicture> = withContext(Dispatchers.IO) {
+    val result = ArrayList<CameraPicture>()
+    var page = 0
+    while (true) {
+        val first = page * imagesPerRequest
+        val count = minOf(imagesPerRequest, numPicsOnCamera - first)
+        if (count <= 0) break
+        val items = browsePictures(numPicsOnCamera - first - count, count).reversed()
+        for (item in items) {
+            val date = item.date ?: throw IllegalStateException("The camera did not report picture dates")
+            if (date < cutoff) return@withContext result
+            result.add(item)
+        }
+        page++
+        delay(THUMBNAIL_PAUSE_MS)
+    }
+    result
+}
+
+/**
+ * Downloads the originals of [pictures] one by one, pausing [BATCH_PAUSE_MS] between them so the
+ * camera has time to process. [onProgress] receives (finished so far, failed so far).
+ * Returns the number of failed pictures.
+ */
+suspend fun downloadBatch(ctx: Context, pictures: List<CameraPicture>, onProgress: (Int, Int) -> Unit): Int {
+    var failed = 0
+    onProgress(0, 0)
+    for ((i, pic) in pictures.withIndex()) {
+        try {
+            withContext(Dispatchers.IO) { downloadHQImage(pic.thumbName, ctx, {}, {}) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            println("Batch download of ${pic.thumbName} failed: $e")
+            failed++
+        }
+        onProgress(i + 1, failed)
+        if (i < pictures.size - 1) delay(BATCH_PAUSE_MS)
+    }
+    return failed
+}

@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -30,7 +31,9 @@ import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -64,10 +67,12 @@ import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat.startActivity
 import coil.compose.AsyncImage
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import net.cheeseverse.shutterlink.ui.theme.ShutterlinkTheme
 import java.io.File
+import java.time.LocalDate
 import java.util.UUID
 
 
@@ -116,6 +121,17 @@ fun initBox(ctx: Context) {
     var connectionToSelect by remember { mutableStateOf(1)}
     var imagePreviewVisible by remember { mutableStateOf(false)}
     var imageToPreview by remember { mutableStateOf("")}
+    var downloadScreen by remember { mutableStateOf("menu") } //"menu" or "preview" in download mode
+    var cameraReady by remember { mutableStateOf(requestedPages >= 0) }
+    var batchBusyText by remember { mutableStateOf<String?>(null) } //shown while counting pictures
+    var batchDays by remember { mutableStateOf(0) }
+    var batchPending by remember { mutableStateOf<List<CameraPicture>?>(null) } //awaiting confirmation
+    var batchRunning by remember { mutableStateOf(false) }
+    var batchDone by remember { mutableStateOf(0) }
+    var batchTotal by remember { mutableStateOf(0) }
+    var batchJob by remember { mutableStateOf<Job?>(null) }
+    var batchResult by remember { mutableStateOf<String?>(null) }
+    val inDownloadMenu = connectionMethodSelected && connectionToSelect == 1 && downloadScreen == "menu"
 
     val snackbarHostState = remember { SnackbarHostState() }
     Scaffold(
@@ -171,6 +187,133 @@ fun initBox(ctx: Context) {
                     AsyncImage(model = File(ctx.cacheDir, imageToPreview), contentDescription = "Image Preview")
                 }
             }
+        }
+
+        if (connectionMethodSelected && connectionToSelect == 1 && downloadScreen == "preview") {
+            BackHandler { downloadScreen = "menu" }
+        }
+
+        if (inDownloadMenu && batchBusyText == null && batchPending == null && !batchRunning && batchResult == null) {
+            Dialog(onDismissRequest = { /*This dialog can't be dismissed*/ }) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (!cameraReady) {
+                            Text("Connecting to camera...")
+                        }
+                        Button(
+                            onClick = { downloadScreen = "preview" },
+                            enabled = cameraReady,
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Preview") }
+                        Text(
+                            "Batch transfer",
+                            fontSize = 4.em,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                        listOf(1 to "Today", 2 to "Last 2 days", 3 to "Last 3 days", 7 to "Last 7 days").forEach { (days, label) ->
+                            OutlinedButton(
+                                onClick = {
+                                    batchDays = days
+                                    batchBusyText = "Counting pictures..."
+                                    GlobalScope.launch {
+                                        try {
+                                            batchPending = listPicturesSince(LocalDate.now().minusDays((days - 1).toLong()))
+                                        } catch (e: Exception) {
+                                            println("Unable to list pictures: $e")
+                                            batchResult = "Unable to read the picture list: ${e.message ?: e}"
+                                        }
+                                        batchBusyText = null
+                                    }
+                                },
+                                enabled = cameraReady,
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text(label) }
+                        }
+                    }
+                }
+            }
+        }
+
+        batchBusyText?.let { text ->
+            Dialog(onDismissRequest = { /*This dialog can't be dismissed*/ }) {
+                Card(modifier = Modifier.fillMaxWidth().padding(16.dp), shape = RoundedCornerShape(16.dp)) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(text)
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
+            }
+        }
+
+        batchPending?.let { pics ->
+            val periodText = if (batchDays == 1) "today" else "in the last $batchDays days"
+            if (pics.isEmpty()) {
+                AlertDialog(
+                    onDismissRequest = { batchPending = null },
+                    title = { Text("Batch transfer") },
+                    text = { Text("No pictures were taken $periodText.") },
+                    confirmButton = { TextButton(onClick = { batchPending = null }) { Text("OK") } }
+                )
+            } else {
+                AlertDialog(
+                    onDismissRequest = { batchPending = null },
+                    title = { Text("Batch transfer") },
+                    text = { Text("${pics.size} picture(s) taken $periodText will be downloaded. A short pause is made between pictures so the camera can keep up. Start?") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            batchPending = null
+                            batchTotal = pics.size
+                            batchDone = 0
+                            batchRunning = true
+                            batchJob = GlobalScope.launch {
+                                try {
+                                    val failed = downloadBatch(ctx, pics) { done, _ -> batchDone = done }
+                                    batchResult = if (failed == 0) "Downloaded ${pics.size} picture(s)."
+                                    else "Downloaded ${pics.size - failed} of ${pics.size} picture(s); $failed failed."
+                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                    batchResult = "Cancelled after $batchDone of ${pics.size} picture(s)."
+                                } finally {
+                                    batchRunning = false
+                                }
+                            }
+                        }) { Text("Download") }
+                    },
+                    dismissButton = { TextButton(onClick = { batchPending = null }) { Text("Cancel") } }
+                )
+            }
+        }
+
+        if (batchRunning) {
+            Dialog(onDismissRequest = { /*This dialog can't be dismissed*/ }) {
+                Card(modifier = Modifier.fillMaxWidth().padding(16.dp), shape = RoundedCornerShape(16.dp)) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Downloading $batchDone of $batchTotal")
+                        LinearProgressIndicator(
+                            progress = { if (batchTotal == 0) 0f else batchDone.toFloat() / batchTotal },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        TextButton(onClick = { batchJob?.cancel() }) { Text("Cancel") }
+                    }
+                }
+            }
+        }
+
+        batchResult?.let { msg ->
+            AlertDialog(
+                onDismissRequest = { batchResult = null },
+                title = { Text("Batch transfer") },
+                text = { Text(msg) },
+                confirmButton = { TextButton(onClick = { batchResult = null }) { Text("OK") } }
+            )
         }
 
         if (!connectionMethodSelected) {
@@ -295,11 +438,13 @@ fun initBox(ctx: Context) {
                 ) {
                     Button(onClick = {
                         if (connectionToSelect == 1) {
+                            downloadScreen = "menu"
                             if (requestedPages < 0) {
                                 GlobalScope.launch { //connect, then request the newest page so we don't have a blank page
                                     resetGallery()
                                     getAvailablePictures()
                                     totalPictures = numPicsOnCamera //grid then loads visible pages itself
+                                    cameraReady = true
                                 }
                             }
                         } else if (connectionToSelect == 2) {
@@ -333,7 +478,7 @@ fun initBox(ctx: Context) {
                 verticalArrangement = Arrangement.Top
             ) {
                 Row(modifier = Modifier.fillMaxSize()) {
-                    PicList(
+                    if (downloadScreen == "preview" || connectionToSelect == 2) PicList(
                         totalPictures,
                         ctx,
                         snackbarHostState,
