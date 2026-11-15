@@ -114,6 +114,21 @@ suspend fun getAvailablePictures() {
     }
 }
 
+const val CAMERA_TIMEOUT_MS = 8000
+const val THUMBNAIL_PAUSE_MS = 50L
+
+/** Like URL.readBytes() but a stalled camera raises an exception instead of blocking forever. */
+fun readBytesWithTimeout(address: String): ByteArray {
+    val con = URL(address).openConnection() as HttpURLConnection
+    con.connectTimeout = CAMERA_TIMEOUT_MS
+    con.readTimeout = CAMERA_TIMEOUT_MS
+    try {
+        return con.inputStream.use { it.readBytes() }
+    } finally {
+        con.disconnect()
+    }
+}
+
 /**
  * Loads one page of [imagesPerRequest] thumbnails. Page 0 holds the newest pictures; grid index
  * 0 is the newest picture. Thumbnails already in the app cache are not downloaded again.
@@ -127,6 +142,8 @@ suspend fun loadThumbnailPage(context: Context, page: Int, onLoaded: (Int, Strin
     println("Requesting page $page: start $startingIndex, count $count")
     val url = URL("http://$cameraIPAddress:60606/Server0/CDS_control")
     val con = url.openConnection() as HttpURLConnection
+    con.connectTimeout = CAMERA_TIMEOUT_MS
+    con.readTimeout = CAMERA_TIMEOUT_MS
     try {
         con.requestMethod = "POST"
         con.setRequestProperty("Content-Type", "text/xml");
@@ -144,8 +161,9 @@ suspend fun loadThumbnailPage(context: Context, page: Int, onLoaded: (Int, Strin
             val cached = File(context.cacheDir, filename)
             if (!cached.exists()) {
                 val tempFile = File.createTempFile(filename, null, context.cacheDir);
-                tempFile.appendBytes(URL(pic).readBytes())
+                tempFile.appendBytes(readBytesWithTimeout(pic))
                 tempFile.renameTo(cached)
+                delay(THUMBNAIL_PAUSE_MS) //go easy on the camera
             }
             onLoaded(firstGridIndex + i, filename)
         }
