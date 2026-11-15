@@ -36,6 +36,25 @@ var cameraIPAddress = ""
 val imagesPerRequest = 21
 var deviceUUID = "4D454930-0100-1000-8001-"
 var cameraMode = ""
+var cameraName = "" //camera model, used as the download folder name
+
+/** Download folder under DCIM: the camera model name, or "Lumix" if it couldn't be read. */
+fun downloadFolder(): String = cameraName.ifEmpty { "Lumix" }
+
+/** Reads the camera model (e.g. DMC-G85) from the capability info; leaves the name empty on failure. */
+fun readCameraName() {
+    try {
+        val text = String(readBytesWithTimeout("http://$cameraIPAddress:80/cam.cgi?mode=getinfo&type=capability"))
+        println("Capability info: $text")
+        for (tag in listOf("model_name", "modelname", "productname", "product_name")) {
+            val m = Regex("<$tag>([^<]+)</$tag>", RegexOption.IGNORE_CASE).find(text) ?: continue
+            val name = m.groupValues[1].trim().replace(Regex("[^A-Za-z0-9_\\- ]"), "").trim()
+            if (name.isNotEmpty()) { cameraName = name; return }
+        }
+    } catch (e: Exception) {
+        println("Unable to read camera name: $e")
+    }
+}
 
 suspend fun doKeepAlive() {
     while(true) {
@@ -91,6 +110,7 @@ suspend fun getCameraIntoPlaybackMode() {
 suspend fun getAvailablePictures() {
     getCameraIntoPlaybackMode() //first get the camera ready
     withContext(Dispatchers.IO) {
+        readCameraName()
         println("Requesting Available Images")
         val url = URL("http://$cameraIPAddress:60606/Server0/CDS_control")
         val con = url.openConnection() as HttpURLConnection
@@ -200,7 +220,7 @@ suspend fun downloadHQImage(path: String, ctx: Context, downloadDialogVisible: (
         info.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
         info.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg");
     }
-    info.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + File.separator + "Shutterlink");
+    info.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + File.separator + downloadFolder());
     val imageUri = resolver.insert(
         if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
         info
@@ -667,15 +687,15 @@ suspend fun downloadBatch(ctx: Context, pictures: List<CameraPicture>, onProgres
     return failed
 }
 
-/** Names (DO*.JPG / DO*.mp4) of files already saved in DCIM/Shutterlink. */
+/** Names (DO*.JPG / DO*.mp4) of files already saved in the camera's download folder (or the old DCIM/Shutterlink). */
 private fun alreadyDownloadedNames(ctx: Context): Set<String> {
     val names = HashSet<String>()
     for (collection in listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)) {
         ctx.contentResolver.query(
             collection,
             arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
-            "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
-            arrayOf("DCIM/Shutterlink/%"),
+            "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? OR ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+            arrayOf("DCIM/${downloadFolder()}/%", "DCIM/Shutterlink/%"), //also the old folder name
             null
         )?.use { c -> while (c.moveToNext()) names.add(c.getString(0)) }
     }
