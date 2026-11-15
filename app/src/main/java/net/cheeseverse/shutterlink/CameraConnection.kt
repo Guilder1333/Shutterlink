@@ -192,16 +192,19 @@ suspend fun downloadHQImage(path: String, ctx: Context, downloadDialogVisible: (
     }
     val resolver = ctx.contentResolver;
     val info = ContentValues();
-    var imageUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, info);
+    // Fill in the name/path/type BEFORE inserting, otherwise MediaStore picks its own name and folder
     if(isVideo) {
         info.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName.substring(0, fileName.length - 3) + "mp4");
         info.put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4");
-        imageUri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, info);
     } else {
         info.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
         info.put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg");
     }
     info.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + File.separator + "Shutterlink");
+    val imageUri = resolver.insert(
+        if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        info
+    );
     val os = resolver.openOutputStream(imageUri!!);
     if (os != null) {
         os.write(imageData)
@@ -663,3 +666,29 @@ suspend fun downloadBatch(ctx: Context, pictures: List<CameraPicture>, onProgres
     }
     return failed
 }
+
+/** Names (DO*.JPG / DO*.mp4) of files already saved in DCIM/Shutterlink. */
+private fun alreadyDownloadedNames(ctx: Context): Set<String> {
+    val names = HashSet<String>()
+    for (collection in listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)) {
+        ctx.contentResolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+            "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+            arrayOf("DCIM/Shutterlink/%"),
+            null
+        )?.use { c -> while (c.moveToNext()) names.add(c.getString(0)) }
+    }
+    return names
+}
+
+/** Splits [pictures] into those still to download and the number already saved on the phone. */
+suspend fun skipAlreadyDownloaded(ctx: Context, pictures: List<CameraPicture>): Pair<List<CameraPicture>, Int> =
+    withContext(Dispatchers.IO) {
+        val have = alreadyDownloadedNames(ctx)
+        val todo = pictures.filter {
+            val base = "DO" + it.thumbName.substring(2, it.thumbName.length - 3)
+            !(have.contains(base + "JPG") || have.contains(base + "mp4"))
+        }
+        todo to (pictures.size - todo.size)
+    }

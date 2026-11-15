@@ -125,6 +125,7 @@ fun initBox(ctx: Context) {
     var cameraReady by remember { mutableStateOf(requestedPages >= 0) }
     var batchBusyText by remember { mutableStateOf<String?>(null) } //shown while counting pictures
     var batchDays by remember { mutableStateOf(0) }
+    var batchSkipped by remember { mutableStateOf(0) }
     var batchPending by remember { mutableStateOf<List<CameraPicture>?>(null) } //awaiting confirmation
     var batchRunning by remember { mutableStateOf(false) }
     var batchDone by remember { mutableStateOf(0) }
@@ -226,7 +227,10 @@ fun initBox(ctx: Context) {
                                     batchBusyText = "Counting pictures..."
                                     GlobalScope.launch {
                                         try {
-                                            batchPending = listPicturesSince(LocalDate.now().minusDays((days - 1).toLong()))
+                                            val found = listPicturesSince(LocalDate.now().minusDays((days - 1).toLong()))
+                                            val (todo, skipped) = skipAlreadyDownloaded(ctx, found)
+                                            batchSkipped = skipped
+                                            batchPending = todo
                                         } catch (e: Exception) {
                                             println("Unable to list pictures: $e")
                                             batchResult = "Unable to read the picture list: ${e.message ?: e}"
@@ -260,14 +264,14 @@ fun initBox(ctx: Context) {
                 AlertDialog(
                     onDismissRequest = { batchPending = null },
                     title = { Text("Batch transfer") },
-                    text = { Text("No pictures were taken $periodText.") },
+                    text = { Text(if (batchSkipped > 0) "All $batchSkipped picture(s) taken $periodText are already downloaded." else "No pictures were taken $periodText.") },
                     confirmButton = { TextButton(onClick = { batchPending = null }) { Text("OK") } }
                 )
             } else {
                 AlertDialog(
                     onDismissRequest = { batchPending = null },
                     title = { Text("Batch transfer") },
-                    text = { Text("${pics.size} picture(s) taken $periodText will be downloaded. A short pause is made between pictures so the camera can keep up. Start?") },
+                    text = { Text("${pics.size} picture(s) taken $periodText will be downloaded${if (batchSkipped > 0) " ($batchSkipped already downloaded, skipped)" else ""}. A short pause is made between pictures so the camera can keep up. Start?") },
                     confirmButton = {
                         TextButton(onClick = {
                             batchPending = null
