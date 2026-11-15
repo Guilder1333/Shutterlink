@@ -8,7 +8,7 @@ Shutterlink is an Android app (Kotlin + Jetpack Compose) that talks to Panasonic
 
 ## Build & test
 
-The Gradle wrapper is incomplete: `gradlew` is committed but `gradle/wrapper/` (jar + properties) is not, so `./gradlew` fails as-is. Either use a system Gradle (AGP 8.8.0 needs Gradle ≥ 8.10.2 and JDK 17) or regenerate the wrapper with `gradle wrapper`. An Android SDK (`ANDROID_HOME` or `local.properties` with `sdk.dir`) is required.
+The Gradle wrapper (Gradle 8.10.2, the minimum for AGP 8.8.0) is committed, so `./gradlew` works; JDK 17 is required. A system `gradle` works too, and the commands below can use either. An Android SDK (`ANDROID_HOME` or `local.properties` with `sdk.dir`) is required.
 
 ```bash
 gradle :app:assembleDebug                 # build debug APK
