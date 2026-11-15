@@ -99,15 +99,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        applicationContext.cacheDir.deleteRecursively()
+        // Keep thumbnails (DT*) cached so they aren't reloaded; drop the larger previews (DL*)
+        applicationContext.cacheDir.listFiles { f -> !f.name.startsWith("DT") }?.forEach { it.deleteRecursively() }
     }
 }
 
 //UI Below
 @Composable
 fun initBox(ctx: Context) {
-    var thumbnails by remember {mutableStateOf(List<String>(0){"empty"})};
-    var olderNewerButtonsVisible by remember { mutableStateOf(false)}
+    var totalPictures by remember { mutableStateOf(numPicsOnCamera)}
     var connectionProgressVisible by remember { mutableStateOf(false) }
     var connectionProgressText by remember { mutableStateOf("Searching for Camera")}
     var downloading by remember { mutableStateOf(false)}
@@ -297,19 +297,10 @@ fun initBox(ctx: Context) {
                         if (connectionToSelect == 1) {
                             if (requestedPages < 0) {
                                 GlobalScope.launch { //connect, then request the newest page so we don't have a blank page
+                                    resetGallery()
                                     getAvailablePictures()
-                                    try {
-                                        enumeratePicturesOnCamera(
-                                            ctx,
-                                            curIndex + imagesPerRequest,
-                                            { newThumbnailList -> thumbnails += newThumbnailList })
-                                    } catch (e: Exception) {
-                                        println("Unable to request more pictures")
-                                    }
-
+                                    totalPictures = numPicsOnCamera //grid then loads visible pages itself
                                 }
-                                olderNewerButtonsVisible = true
-
                             }
                         } else if (connectionToSelect == 2) {
                             GlobalScope.launch {
@@ -343,7 +334,7 @@ fun initBox(ctx: Context) {
             ) {
                 Row(modifier = Modifier.fillMaxSize()) {
                     PicList(
-                        thumbnails,
+                        totalPictures,
                         ctx,
                         snackbarHostState,
                         { visible -> downloading = visible },
@@ -369,73 +360,6 @@ fun initBox(ctx: Context) {
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                             }
-                            if (olderNewerButtonsVisible) {
-                                OutlinedButton(
-                                    modifier = Modifier
-                                        .width(100.dp)
-                                        .height(50.dp),
-                                    onClick = {
-                                        while (requestedPages < 0) {
-                                        } //gotta wait for init, might not have happened yet
-                                        if (requestedPages >= 0) {
-                                            GlobalScope.launch {
-                                                thumbnails = List<String>(0) { "" }
-                                                try {
-                                                    enumeratePicturesOnCamera(
-                                                        ctx,
-                                                        curIndex + imagesPerRequest,
-                                                        { newThumbnailList -> thumbnails += newThumbnailList })
-                                                } catch (e: Exception) {
-                                                    println("Unable to request more pictures")
-                                                }
-                                            }
-                                            requestedPages += 1
-                                        }
-                                    }) {
-                                    Text("Newer", color = MaterialTheme.colorScheme.onBackground)
-                                }
-
-//                                OutlinedButton(
-//                                    modifier = Modifier
-//                                        .width(100.dp)
-//                                        .height(50.dp),
-//                                    onClick = {
-//                                            GlobalScope.launch {
-//                                                try {
-//                                                    captureImage()
-//                                                } catch (e: Exception) {
-//                                                    println("Unable to capture image")
-//                                                }
-//                                            }
-//                                    }) {
-//                                    Text("Capture", color = MaterialTheme.colorScheme.onBackground)
-//                                }
-
-                                OutlinedButton(
-                                    modifier = Modifier
-                                        .width(100.dp)
-                                        .height(50.dp),
-                                    onClick = {
-                                        while (requestedPages < 0) {
-                                        } //gotta wait for init, might not have happened yet
-                                        if (requestedPages >= 0) {
-                                            GlobalScope.launch {
-                                                thumbnails = List<String>(0) { "" }
-                                                try {
-                                                    enumeratePicturesOnCamera(
-                                                        ctx,
-                                                        curIndex - imagesPerRequest,
-                                                        { newThumbnailList -> thumbnails += newThumbnailList })
-                                                } catch (e: Exception) {
-                                                    println("Unable to request more pictures")
-                                                }
-                                            }
-                                            requestedPages += 1
-                                        }
-                                    }) {
-                                    Text("Older", color = MaterialTheme.colorScheme.onBackground)
-                                }
-                            }
                         }
                     }
                 }
@@ -446,87 +370,4 @@ fun initBox(ctx: Context) {
 
         }
     }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun PicList(imagePaths: List<String>, ctx: Context, snackbarHostState: SnackbarHostState, downloading: (Boolean) -> Unit, downloadProgress: (Float) -> Unit, imagePreviewVisible: (Boolean) -> Unit, imageToPreview: (String) -> Unit) {
-    val scope = rememberCoroutineScope()
-
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = 128.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
-    ) {
-        items(imagePaths.size) { index ->
-            AsyncImage(
-                model = File(ctx.cacheDir, imagePaths[index]),
-                contentDescription = null,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(
-                        1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(
-                            topStart = 8.dp,
-                            topEnd = 8.dp,
-                            bottomStart = 8.dp,
-                            bottomEnd = 8.dp
-                        )
-                    )
-                    .wrapContentHeight()
-                    .combinedClickable(
-                        onLongClick = {
-                            GlobalScope.launch {
-                                downloadThumbnail(ctx, "DL" + imagePaths[index].substring(2), imageToPreview)
-                                imagePreviewVisible(true)
-                            }
-//                            imageToPreview(imagePaths[index])
-                        },
-                        onClick = {
-                            GlobalScope.launch {
-                                val imageUri = downloadHQImage(
-                                    imagePaths[index],
-                                    ctx,
-                                    { visible -> downloading(visible) },
-                                    downloadProgress
-                                )
-                                scope.launch {
-                                    val result = snackbarHostState
-                                        .showSnackbar(
-                                            message = "Content Downloaded",
-                                            actionLabel = "Open",
-                                            duration = SnackbarDuration.Short,
-                                            withDismissAction = true
-                                        )
-                                    when (result) {
-                                        SnackbarResult.ActionPerformed -> {
-                                            val intent = Intent(Intent.ACTION_VIEW)
-                                            intent.setDataAndType(imageUri, "image/*")
-                                            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                                            if (intent.resolveActivity(ctx.packageManager) != null) {
-                                                startActivity(ctx, intent, null)
-                                            }
-                                        }
-
-                                        SnackbarResult.Dismissed -> {
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    )
-                    .clip(
-                        shape = RoundedCornerShape(
-                            topStart = 8.dp,
-                            topEnd = 8.dp,
-                            bottomStart = 8.dp,
-                            bottomEnd = 8.dp
-                        )
-                    ),
-                contentScale = ContentScale.Crop
-            )
-        }
-    }
-//    })
 }
