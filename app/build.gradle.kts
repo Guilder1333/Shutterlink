@@ -11,8 +11,8 @@ android {
         applicationId = "net.cheeseverse.shutterlink"
         minSdk = 33
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.2"
+        versionCode = 2
+        versionName = "1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -20,8 +20,23 @@ android {
         }
     }
 
+    // Release signing comes from env vars (set by CI); falls back to the debug key so
+    // local `assembleRelease` still produces an installable APK.
+    val releaseKeystore = System.getenv("KEYSTORE_FILE")
+    signingConfigs {
+        if (!releaseKeystore.isNullOrEmpty()) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
