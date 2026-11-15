@@ -99,14 +99,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        applicationContext.cacheDir.deleteRecursively()
+        // Keep thumbnails (DT*) cached so they aren't reloaded; drop the larger previews (DL*)
+        applicationContext.cacheDir.listFiles { f -> !f.name.startsWith("DT") }?.forEach { it.deleteRecursively() }
     }
 }
 
 //UI Below
 @Composable
 fun initBox(ctx: Context) {
-    var thumbnails by remember {mutableStateOf(List<String>(0){"empty"})};
     var totalPictures by remember { mutableStateOf(numPicsOnCamera)}
     var connectionProgressVisible by remember { mutableStateOf(false) }
     var connectionProgressText by remember { mutableStateOf("Searching for Camera")}
@@ -297,17 +297,9 @@ fun initBox(ctx: Context) {
                         if (connectionToSelect == 1) {
                             if (requestedPages < 0) {
                                 GlobalScope.launch { //connect, then request the newest page so we don't have a blank page
+                                    resetGallery()
                                     getAvailablePictures()
-                                    totalPictures = numPicsOnCamera
-                                    try {
-                                        enumeratePicturesOnCamera(
-                                            ctx,
-                                            curIndex + imagesPerRequest,
-                                            { newThumbnailList -> thumbnails += newThumbnailList })
-                                    } catch (e: Exception) {
-                                        println("Unable to request more pictures")
-                                    }
-
+                                    totalPictures = numPicsOnCamera //grid then loads visible pages itself
                                 }
                             }
                         } else if (connectionToSelect == 2) {
@@ -343,7 +335,6 @@ fun initBox(ctx: Context) {
                 Row(modifier = Modifier.fillMaxSize()) {
                     PicList(
                         totalPictures,
-                        thumbnails,
                         ctx,
                         snackbarHostState,
                         { visible -> downloading = visible },

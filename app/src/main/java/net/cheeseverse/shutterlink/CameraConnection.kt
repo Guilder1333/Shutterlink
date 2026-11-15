@@ -114,44 +114,44 @@ suspend fun getAvailablePictures() {
     }
 }
 
-suspend fun enumeratePicturesOnCamera(context: Context, indexToGet: Int, thumbnailList: (String) -> Unit){
-    var mostRecentIndex = indexToGet;
-    if(indexToGet > numPicsOnCamera) {
-        mostRecentIndex = numPicsOnCamera; //can't request more than on the camera
-    } else if (indexToGet < 0) {
-        mostRecentIndex = imagesPerRequest;
-    }
-    println("Requesting, last index is $mostRecentIndex")
-    var fileArray = List<String>(0) {"empty"}; //thumbnail storage
-    println("Opening Control Channel")
+/**
+ * Loads one page of [imagesPerRequest] thumbnails. Page 0 holds the newest pictures; grid index
+ * 0 is the newest picture. Thumbnails already in the app cache are not downloaded again.
+ * [onLoaded] receives the grid index and cached file name of each thumbnail.
+ */
+suspend fun loadThumbnailPage(context: Context, page: Int, onLoaded: (Int, String) -> Unit) = withContext(Dispatchers.IO) {
+    val firstGridIndex = page * imagesPerRequest
+    val count = minOf(imagesPerRequest, numPicsOnCamera - firstGridIndex)
+    if (count <= 0) return@withContext
+    val startingIndex = numPicsOnCamera - firstGridIndex - count //camera index is oldest first
+    println("Requesting page $page: start $startingIndex, count $count")
     val url = URL("http://$cameraIPAddress:60606/Server0/CDS_control")
     val con = url.openConnection() as HttpURLConnection
-    con.requestMethod = "POST"  // optional default is GET
-    con.setRequestProperty("Content-Type", "text/xml");
-    con.setRequestProperty("SOAPACTION", "urn:schemas-upnp-org:service:ContentDirectory:1#Browse");
-    con.doOutput = true;
-    con.outputStream.use { os ->
-        val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\" xmlns:pana=\"urn:schemas-panasonic-com:pana\"><ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>${mostRecentIndex - imagesPerRequest}</StartingIndex><RequestedCount>$imagesPerRequest</RequestedCount><SortCriteria></SortCriteria><pana:X_FromCP>Shutterlink</pana:X_FromCP></u:Browse></s:Body></s:Envelope>".toByteArray(Charsets.UTF_8)
-        os.write(body, 0, body.size)
-    }
-    val data = con.inputStream.bufferedReader().readText();
-    val picURLs = Regex("http://\\d{2,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}:\\d+/\\w+\\.JPG").findAll(data).map { url -> url.value }.toList() //get as list
-    println("Got image list")
-    for(pic in picURLs.reversed()) { //reversed to put the most recent first
-        if(pic.contains("/DT")) {
-            var url = URL(pic)
-            val filename = pic.substring(pic.lastIndexOf("/") + 1)
-            val imageData = url.readBytes();
-            val tempFile = File.createTempFile(filename, null, context.cacheDir);
-            tempFile.appendBytes(imageData)
-            fileArray += pic.substring(pic.lastIndexOf("/") + 1)
-            con.disconnect()
-            tempFile.renameTo(File(context.cacheDir, pic.substring(pic.lastIndexOf("/") + 1)))
-            thumbnailList(pic.substring(pic.lastIndexOf("/") + 1))
+    try {
+        con.requestMethod = "POST"
+        con.setRequestProperty("Content-Type", "text/xml");
+        con.setRequestProperty("SOAPACTION", "urn:schemas-upnp-org:service:ContentDirectory:1#Browse");
+        con.doOutput = true;
+        con.outputStream.use { os ->
+            val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\" xmlns:pana=\"urn:schemas-panasonic-com:pana\"><ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>$startingIndex</StartingIndex><RequestedCount>$count</RequestedCount><SortCriteria></SortCriteria><pana:X_FromCP>Shutterlink</pana:X_FromCP></u:Browse></s:Body></s:Envelope>".toByteArray(Charsets.UTF_8)
+            os.write(body, 0, body.size)
         }
+        val data = con.inputStream.bufferedReader().readText();
+        val picURLs = Regex("http://\\d{2,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}:\\d+/\\w+\\.JPG").findAll(data).map { m -> m.value }.filter { it.contains("/DT") }.toList()
+        //the camera lists oldest first; reverse so grid index 0 is the newest
+        picURLs.reversed().forEachIndexed { i, pic ->
+            val filename = pic.substring(pic.lastIndexOf("/") + 1)
+            val cached = File(context.cacheDir, filename)
+            if (!cached.exists()) {
+                val tempFile = File.createTempFile(filename, null, context.cacheDir);
+                tempFile.appendBytes(URL(pic).readBytes())
+                tempFile.renameTo(cached)
+            }
+            onLoaded(firstGridIndex + i, filename)
+        }
+    } finally {
+        con.disconnect()
     }
-//    picCon.disconnect()
-    curIndex = mostRecentIndex;
 }
 
 suspend fun downloadHQImage(path: String, ctx: Context, downloadDialogVisible: (Boolean) -> Unit, downloadProgress: (Float) -> Unit): Uri {
